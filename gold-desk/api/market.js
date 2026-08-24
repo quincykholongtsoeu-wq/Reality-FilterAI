@@ -4,6 +4,18 @@ const FRED = {
   real10y: 'DFII10'
 };
 
+const FETCH_TIMEOUT_MS = 6000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fredLatest(series) {
   const apiKey = process.env.FRED_API_KEY;
   if (!apiKey) throw new Error('FRED_API_KEY is missing');
@@ -15,7 +27,7 @@ async function fredLatest(series) {
   url.searchParams.set('sort_order', 'desc');
   url.searchParams.set('limit', '10');
 
-  const r = await fetch(url, { headers: { 'user-agent': 'gold-desk/0.4' } });
+  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'gold-desk/0.4' } });
   if (!r.ok) throw new Error(`FRED ${series} ${r.status}`);
   const j = await r.json();
 
@@ -38,7 +50,7 @@ async function fredLatest(series) {
 
 async function yahoo(symbol) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=1d&includePrePost=true`;
-  const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
+  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
   if (!r.ok) throw new Error(`Market feed ${symbol} ${r.status}`);
   const j = await r.json();
   const result = j?.chart?.result?.[0];
@@ -100,7 +112,7 @@ function classify(data) {
 }
 
 const valueOrNull = (settled) => settled.status === 'fulfilled' ? settled.value : null;
-const errorOrNull = (settled) => settled.status === 'rejected' ? settled.reason?.message || String(settled.reason) : null;
+const errorOrNull = (settled) => settled.status === 'rejected' ? settled.reason?.name === 'AbortError' ? 'Feed timed out after 6s' : (settled.reason?.message || String(settled.reason)) : null;
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control','s-maxage=60, stale-while-revalidate=120');
@@ -142,6 +154,7 @@ export default async function handler(req, res) {
       market: Boolean(data.gold || data.dxy)
     },
     notes: [
+      'Each external feed now has a hard 6-second timeout.',
       'Gold feed uses COMEX Gold Futures (GC=F) as a market proxy, not broker XAUUSD spot.',
       'Treasury and real-yield observations are official FRED series and are not tick-by-tick.',
       'A failed Gold or DXY proxy no longer blocks FRED yields from loading.',

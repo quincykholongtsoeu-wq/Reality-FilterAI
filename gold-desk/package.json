@@ -1,0 +1,9 @@
+{
+  "name": "gold-desk-v03",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "type": "module"
+}

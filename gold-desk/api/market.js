@@ -27,7 +27,7 @@ async function fredLatest(series) {
   url.searchParams.set('sort_order', 'desc');
   url.searchParams.set('limit', '10');
 
-  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'gold-desk/0.4' } });
+  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'gold-desk/0.5' } });
   if (!r.ok) throw new Error(`FRED ${series} ${r.status}`);
   const j = await r.json();
 
@@ -48,10 +48,49 @@ async function fredLatest(series) {
   };
 }
 
+async function goldLatest() {
+  const url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=5m&range=1d&includePrePost=true';
+  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
+  if (!r.ok) throw new Error(`Gold proxy ${r.status}`);
+  const j = await r.json();
+  const result = j?.chart?.result?.[0];
+  if (!result) throw new Error('Gold proxy returned no result');
+
+  const meta = result.meta || {};
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const timestamps = result.timestamp || [];
+  let last = null;
+  let ts = null;
+
+  for (let i = closes.length - 1; i >= 0; i--) {
+    if (Number.isFinite(closes[i])) {
+      last = closes[i];
+      ts = timestamps[i] || null;
+      break;
+    }
+  }
+
+  const previousClose = Number.isFinite(meta.chartPreviousClose) ? meta.chartPreviousClose : null;
+  const price = last ?? meta.regularMarketPrice ?? null;
+  const changePct = (Number.isFinite(price) && Number.isFinite(previousClose) && previousClose !== 0)
+    ? ((price - previousClose) / previousClose) * 100
+    : null;
+
+  return {
+    symbol: 'GC=F',
+    price,
+    previousClose,
+    changePct,
+    timestamp: ts ? new Date(ts * 1000).toISOString() : null,
+    source: 'Yahoo Finance COMEX Gold Futures proxy'
+  };
+}
+
 function classify(data) {
   let score = 0;
   const reasons = [];
   const realCh = data.real10y?.change;
+  const goldCh = data.gold?.changePct;
 
   if (Number.isFinite(realCh)) {
     if (realCh <= -0.02) {
@@ -65,12 +104,24 @@ function classify(data) {
     }
   }
 
-  if (!reasons.length) reasons.push('FRED data not available yet. WAIT.');
+  if (Number.isFinite(goldCh)) {
+    if (goldCh >= 0.35) {
+      score += 1;
+      reasons.push(`Gold futures are confirming strength (+${goldCh.toFixed(2)}% versus prior close).`);
+    } else if (goldCh <= -0.35) {
+      score -= 1;
+      reasons.push(`Gold futures are confirming weakness (${goldCh.toFixed(2)}% versus prior close).`);
+    } else {
+      reasons.push(`Gold futures are near flat (${goldCh >= 0 ? '+' : ''}${goldCh.toFixed(2)}%).`);
+    }
+  }
+
+  if (!reasons.length) reasons.push('Not enough live inputs yet. WAIT.');
 
   let bias = 'WAIT';
   let confidence = 50;
-  if (score >= 3) { bias = 'LONG BIAS'; confidence = 64; }
-  if (score <= -3) { bias = 'SHORT BIAS'; confidence = 64; }
+  if (score >= 3) { bias = 'LONG BIAS'; confidence = Math.min(72, 58 + score * 3); }
+  if (score <= -3) { bias = 'SHORT BIAS'; confidence = Math.min(72, 58 + Math.abs(score) * 3); }
 
   return { bias, confidence, score, reasons };
 }
@@ -81,17 +132,19 @@ const errorOrNull = (settled) => settled.status === 'rejected'
   : null;
 
 export default async function handler(req, res) {
-  res.setHeader('Cache-Control','no-store');
+  res.setHeader('Cache-Control', 'no-store');
 
   const results = await Promise.allSettled([
     fredLatest(FRED.us2y),
     fredLatest(FRED.us10y),
-    fredLatest(FRED.real10y)
+    fredLatest(FRED.real10y),
+    goldLatest()
   ]);
 
-  const [us2yR, us10yR, real10yR] = results;
+  const [us2yR, us10yR, real10yR, goldR] = results;
+
   const data = {
-    gold: null,
+    gold: valueOrNull(goldR),
     dxy: null,
     us2y: valueOrNull(us2yR),
     us10y: valueOrNull(us10yR),
@@ -99,8 +152,8 @@ export default async function handler(req, res) {
   };
 
   const errors = {
-    gold: 'Market proxy temporarily disabled while debugging',
-    dxy: 'Market proxy temporarily disabled while debugging',
+    gold: errorOrNull(goldR),
+    dxy: 'DXY temporarily isolated while Gold is validated',
     us2y: errorOrNull(us2yR),
     us10y: errorOrNull(us10yR),
     real10y: errorOrNull(real10yR)
@@ -110,7 +163,7 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     ok: true,
-    mode: 'FRED_ONLY_DEBUG',
+    mode: 'FRED_PLUS_GOLD_VALIDATION',
     generatedAt: new Date().toISOString(),
     data,
     errors,
@@ -118,11 +171,13 @@ export default async function handler(req, res) {
     connections: {
       fredKeyPresent: Boolean(process.env.FRED_API_KEY),
       fred: Boolean(data.us2y || data.us10y || data.real10y),
-      market: false
+      gold: Boolean(data.gold),
+      dxy: false
     },
     notes: [
-      'Gold and DXY proxies are temporarily disabled so they cannot block FRED.',
-      'Each FRED request has a hard 6-second timeout.',
+      'Gold has been reconnected as an isolated COMEX Gold Futures proxy with a hard 6-second timeout.',
+      'DXY remains disabled until Gold is proven stable.',
+      'FRED remains the official source for Treasury and real-yield observations.',
       'This is research intelligence, not an order-execution system.'
     ]
   });

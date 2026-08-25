@@ -1,132 +1,17 @@
-const FRED = {
-  us2y: 'DGS2',
-  us10y: 'DGS10',
-  real10y: 'DFII10'
-};
-
-const FETCH_TIMEOUT_MS = 6000;
-
-async function fetchWithTimeout(url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fredLatest(series) {
-  const apiKey = process.env.FRED_API_KEY;
-  if (!apiKey) throw new Error('FRED_API_KEY is missing');
-  const url = new URL('https://api.stlouisfed.org/fred/series/observations');
-  url.searchParams.set('series_id', series);
-  url.searchParams.set('api_key', apiKey);
-  url.searchParams.set('file_type', 'json');
-  url.searchParams.set('sort_order', 'desc');
-  url.searchParams.set('limit', '10');
-  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'gold-desk/0.5' } });
-  if (!r.ok) throw new Error(`FRED ${series} ${r.status}`);
-  const j = await r.json();
-  const vals = [];
-  for (const o of j?.observations || []) {
-    if (o?.value === '.' || o?.value == null) continue;
-    const v = Number(o.value);
-    if (Number.isFinite(v)) vals.push({ date: o.date, value: v });
-    if (vals.length >= 2) break;
-  }
-  if (!vals.length) return null;
-  return { value: vals[0].value, date: vals[0].date, change: vals.length > 1 ? vals[0].value - vals[1].value : null, source: 'FRED API' };
-}
-
-async function yahooLatest(symbol, label) {
-  const encoded = encodeURIComponent(symbol);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=5m&range=1d&includePrePost=true`;
-  const r = await fetchWithTimeout(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
-  if (!r.ok) throw new Error(`${label} proxy ${r.status}`);
-  const j = await r.json();
-  const result = j?.chart?.result?.[0];
-  if (!result) throw new Error(`${label} proxy returned no result`);
-  const meta = result.meta || {};
-  const closes = result.indicators?.quote?.[0]?.close || [];
-  const timestamps = result.timestamp || [];
-  let last = null, ts = null;
-  for (let i = closes.length - 1; i >= 0; i--) {
-    if (Number.isFinite(closes[i])) { last = closes[i]; ts = timestamps[i] || null; break; }
-  }
-  const previousClose = Number.isFinite(meta.chartPreviousClose) ? meta.chartPreviousClose : null;
-  const price = last ?? meta.regularMarketPrice ?? null;
-  if (!Number.isFinite(price)) throw new Error(`${label} proxy returned no usable price`);
-  const changePct = Number.isFinite(previousClose) && previousClose !== 0 ? ((price - previousClose) / previousClose) * 100 : null;
-  return { symbol, price, previousClose, changePct, timestamp: ts ? new Date(ts * 1000).toISOString() : null, source: `Yahoo Finance ${label} proxy` };
-}
-
-const goldLatest = () => yahooLatest('GC=F', 'COMEX Gold Futures');
-const dxyLatest = () => yahooLatest('DX-Y.NYB', 'US Dollar Index');
-
-function classify(data) {
-  let score = 0;
-  const reasons = [];
-  const realCh = data.real10y?.change;
-  const goldCh = data.gold?.changePct;
-  const dxyCh = data.dxy?.changePct;
-
-  if (Number.isFinite(realCh)) {
-    if (realCh <= -0.02) { score += 3; reasons.push(`10Y real yield fell ${Math.abs(realCh).toFixed(3)} percentage points.`); }
-    else if (realCh >= 0.02) { score -= 3; reasons.push(`10Y real yield rose ${realCh.toFixed(3)} percentage points.`); }
-    else reasons.push('10Y real yield is broadly unchanged.');
-  }
-
-  if (Number.isFinite(dxyCh)) {
-    if (dxyCh <= -0.20) { score += 2; reasons.push(`DXY is weakening (${dxyCh.toFixed(2)}%), supportive for gold.`); }
-    else if (dxyCh >= 0.20) { score -= 2; reasons.push(`DXY is strengthening (+${dxyCh.toFixed(2)}%), a headwind for gold.`); }
-    else reasons.push(`DXY is near flat (${dxyCh >= 0 ? '+' : ''}${dxyCh.toFixed(2)}%).`);
-  }
-
-  if (Number.isFinite(goldCh)) {
-    if (goldCh >= 0.35) { score += 1; reasons.push(`Gold confirms strength (+${goldCh.toFixed(2)}%).`); }
-    else if (goldCh <= -0.35) { score -= 1; reasons.push(`Gold confirms weakness (${goldCh.toFixed(2)}%).`); }
-    else reasons.push(`Gold is near flat (${goldCh >= 0 ? '+' : ''}${goldCh.toFixed(2)}%).`);
-  }
-
-  if (!reasons.length) reasons.push('Not enough live inputs yet. WAIT.');
-  let bias = 'WAIT', confidence = 50;
-  if (score >= 3) { bias = 'LONG BIAS'; confidence = Math.min(80, 56 + score * 4); }
-  if (score <= -3) { bias = 'SHORT BIAS'; confidence = Math.min(80, 56 + Math.abs(score) * 4); }
-  return { bias, confidence, score, reasons };
-}
-
-const valueOrNull = s => s.status === 'fulfilled' ? s.value : null;
-const errorOrNull = s => s.status === 'rejected' ? (s.reason?.name === 'AbortError' ? 'Feed timed out after 6s' : (s.reason?.message || String(s.reason))) : null;
-
-export default async function handler(req, res) {
-  res.setHeader('Cache-Control', 'no-store');
-  const results = await Promise.allSettled([
-    fredLatest(FRED.us2y), fredLatest(FRED.us10y), fredLatest(FRED.real10y), goldLatest(), dxyLatest()
-  ]);
-  const [us2yR, us10yR, real10yR, goldR, dxyR] = results;
-  const data = {
-    gold: valueOrNull(goldR), dxy: valueOrNull(dxyR), us2y: valueOrNull(us2yR), us10y: valueOrNull(us10yR), real10y: valueOrNull(real10yR)
-  };
-  const errors = {
-    gold: errorOrNull(goldR), dxy: errorOrNull(dxyR), us2y: errorOrNull(us2yR), us10y: errorOrNull(us10yR), real10y: errorOrNull(real10yR)
-  };
-  const read = classify(data);
-  return res.status(200).json({
-    ok: true,
-    mode: 'LIVE_MACRO_CORE',
-    generatedAt: new Date().toISOString(),
-    data, errors, read,
-    connections: {
-      fredKeyPresent: Boolean(process.env.FRED_API_KEY),
-      fred: Boolean(data.us2y || data.us10y || data.real10y),
-      gold: Boolean(data.gold),
-      dxy: Boolean(data.dxy)
-    },
-    notes: [
-      'FRED, Gold and DXY run independently with hard timeouts so one failed feed cannot block the desk.',
-      'DXY is used as macro evidence, not as a standalone trading signal.',
-      'This is research intelligence, not an order-execution system.'
-    ]
-  });
-}
+const FRED={us2y:'DGS2',us10y:'DGS10',real10y:'DFII10'};
+const FETCH_TIMEOUT_MS=6000;
+async function fetchWithTimeout(url,options={}){const c=new AbortController();const t=setTimeout(()=>c.abort(),FETCH_TIMEOUT_MS);try{return await fetch(url,{...options,signal:c.signal})}finally{clearTimeout(t)}}
+async function fredLatest(series){const apiKey=process.env.FRED_API_KEY;if(!apiKey)throw new Error('FRED_API_KEY is missing');const url=new URL('https://api.stlouisfed.org/fred/series/observations');url.searchParams.set('series_id',series);url.searchParams.set('api_key',apiKey);url.searchParams.set('file_type','json');url.searchParams.set('sort_order','desc');url.searchParams.set('limit','10');const r=await fetchWithTimeout(url,{headers:{'user-agent':'gold-desk/0.6'}});if(!r.ok)throw new Error(`FRED ${series} ${r.status}`);const j=await r.json();const vals=[];for(const o of j?.observations||[]){if(o?.value==='.'||o?.value==null)continue;const v=Number(o.value);if(Number.isFinite(v))vals.push({date:o.date,value:v});if(vals.length>=2)break}if(!vals.length)return null;return{value:vals[0].value,date:vals[0].date,change:vals.length>1?vals[0].value-vals[1].value:null,source:'FRED API'}}
+async function yahooLatest(symbol,label){const url=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=1d&includePrePost=true`;const r=await fetchWithTimeout(url,{headers:{'user-agent':'Mozilla/5.0'}});if(!r.ok)throw new Error(`${label} proxy ${r.status}`);const j=await r.json();const result=j?.chart?.result?.[0];if(!result)throw new Error(`${label} proxy returned no result`);const meta=result.meta||{},closes=result.indicators?.quote?.[0]?.close||[],timestamps=result.timestamp||[];let last=null,ts=null;for(let i=closes.length-1;i>=0;i--){if(Number.isFinite(closes[i])){last=closes[i];ts=timestamps[i]||null;break}}const previousClose=Number.isFinite(meta.chartPreviousClose)?meta.chartPreviousClose:null;const price=last??meta.regularMarketPrice??null;if(!Number.isFinite(price))throw new Error(`${label} proxy returned no usable price`);const changePct=Number.isFinite(previousClose)&&previousClose!==0?((price-previousClose)/previousClose)*100:null;return{symbol,price,previousClose,changePct,timestamp:ts?new Date(ts*1000).toISOString():null,source:`Yahoo Finance ${label} proxy`}}
+const goldLatest=()=>yahooLatest('GC=F','COMEX Gold Futures');
+const dxyLatest=()=>yahooLatest('DX-Y.NYB','US Dollar Index');
+function classify(data){let score=0,signals=0;const reasons=[];const realCh=data.real10y?.change,goldCh=data.gold?.changePct,dxyCh=data.dxy?.changePct,y2=data.us2y?.change,y10=data.us10y?.change;
+if(Number.isFinite(realCh)){signals++;if(realCh<=-.04){score+=4;reasons.push(`Real yields dropped hard (${realCh.toFixed(3)}pp): strong gold tailwind.`)}else if(realCh<=-.015){score+=2;reasons.push(`Real yields fell ${Math.abs(realCh).toFixed(3)}pp: gold supportive.`)}else if(realCh>=.04){score-=4;reasons.push(`Real yields jumped +${realCh.toFixed(3)}pp: strong gold headwind.`)}else if(realCh>=.015){score-=2;reasons.push(`Real yields rose +${realCh.toFixed(3)}pp: gold headwind.`)}else reasons.push('Real yields are broadly flat.')}
+if(Number.isFinite(dxyCh)){signals++;if(dxyCh<=-.35){score+=3;reasons.push(`DXY is materially weaker (${dxyCh.toFixed(2)}%): bullish impulse.`)}else if(dxyCh<=-.12){score+=1;reasons.push(`DXY is softer (${dxyCh.toFixed(2)}%).`)}else if(dxyCh>=.35){score-=3;reasons.push(`DXY is materially stronger (+${dxyCh.toFixed(2)}%): bearish impulse.`)}else if(dxyCh>=.12){score-=1;reasons.push(`DXY is firmer (+${dxyCh.toFixed(2)}%).`)}else reasons.push(`DXY is near flat (${dxyCh>=0?'+':''}${dxyCh.toFixed(2)}%).`)}
+if(Number.isFinite(y2)){signals++;if(y2<=-.04)score+=2;else if(y2>=.04)score-=2;reasons.push(`2Y yield daily change: ${y2>=0?'+':''}${y2.toFixed(3)}pp.`)}
+if(Number.isFinite(y10)){signals++;if(y10<=-.04)score+=1;else if(y10>=.04)score-=1;reasons.push(`10Y yield daily change: ${y10>=0?'+':''}${y10.toFixed(3)}pp.`)}
+if(Number.isFinite(goldCh)){signals++;if(goldCh>=.75){score+=3;reasons.push(`Gold momentum confirms strongly (+${goldCh.toFixed(2)}%).`)}else if(goldCh>=.25){score+=1;reasons.push(`Gold momentum confirms (+${goldCh.toFixed(2)}%).`)}else if(goldCh<=-.75){score-=3;reasons.push(`Gold momentum confirms strongly (${goldCh.toFixed(2)}%).`)}else if(goldCh<=-.25){score-=1;reasons.push(`Gold momentum confirms (${goldCh.toFixed(2)}%).`)}else reasons.push(`Gold is near flat (${goldCh>=0?'+':''}${goldCh.toFixed(2)}%).`)}
+const macroDirection=Math.sign((Number.isFinite(realCh)?-realCh*100:0)+(Number.isFinite(dxyCh)?-dxyCh:0));const priceDirection=Number.isFinite(goldCh)?Math.sign(goldCh):0;const conflict=macroDirection&&priceDirection&&macroDirection!==priceDirection;if(conflict){score*=.65;reasons.push('⚠ Macro and price disagree. Conviction automatically reduced.')}
+const abs=Math.abs(score);let bias='WAIT',confidence=50,regime='MIXED';if(score>=3){bias='LONG BIAS';regime=abs>=7?'BULL CONVICTION':'BULL LEAN'}else if(score<=-3){bias='SHORT BIAS';regime=abs>=7?'BEAR CONVICTION':'BEAR LEAN'}confidence=Math.round(Math.min(92,50+abs*5));if(signals<3)confidence=Math.min(confidence,58);if(conflict)confidence=Math.min(confidence,64);const riskTier=confidence>=80&&!conflict?'A+ SETUP':confidence>=68?'A SETUP':bias==='WAIT'?'NO TRADE':'B SETUP';return{bias,confidence,score:Number(score.toFixed(2)),regime,riskTier,conflict,signals,reasons}}
+const valueOrNull=s=>s.status==='fulfilled'?s.value:null;const errorOrNull=s=>s.status==='rejected'?(s.reason?.name==='AbortError'?'Feed timed out after 6s':(s.reason?.message||String(s.reason))):null;
+export default async function handler(req,res){res.setHeader('Cache-Control','no-store');const results=await Promise.allSettled([fredLatest(FRED.us2y),fredLatest(FRED.us10y),fredLatest(FRED.real10y),goldLatest(),dxyLatest()]);const[us2yR,us10yR,real10yR,goldR,dxyR]=results;const data={gold:valueOrNull(goldR),dxy:valueOrNull(dxyR),us2y:valueOrNull(us2yR),us10y:valueOrNull(us10yR),real10y:valueOrNull(real10yR)};const errors={gold:errorOrNull(goldR),dxy:errorOrNull(dxyR),us2y:errorOrNull(us2yR),us10y:errorOrNull(us10yR),real10y:errorOrNull(real10yR)};const read=classify(data);return res.status(200).json({ok:true,version:'0.6',mode:'CONVICTION_ENGINE',generatedAt:new Date().toISOString(),data,errors,read,risk:{maxPlannedRiskPct:.25,maxDailyLossPct:.75,maxConsecutiveLosses:3,rule:'Aggressive conviction, defensive capital. Never increase risk to recover a loss.'},connections:{fredKeyPresent:Boolean(process.env.FRED_API_KEY),fred:Boolean(data.us2y||data.us10y||data.real10y),gold:Boolean(data.gold),dxy:Boolean(data.dxy)},notes:['Five-factor macro conviction engine: real yields, DXY, 2Y, 10Y and gold momentum.','Conflicting macro/price evidence automatically caps conviction.','A+ means evidence alignment, not permission to trade without price confirmation.']})}
